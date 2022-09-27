@@ -1,4 +1,5 @@
 [workspace]
 members = [
+	"amethyst",
 	"amethyst-methods"
 ]
