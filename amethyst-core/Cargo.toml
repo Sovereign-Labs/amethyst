@@ -7,4 +7,9 @@ edition = "2021"
 
 [dependencies]
 risc0-zkvm = "0.11"
-primitive-types = { version = "0.11", default-features = false }
+risc0-zkvm-guest = "0.11"
+primitive-types = { version = "0.11", default-features = false, features = ["serde_no_std"]}
+serde = "1"
+revm = { path = "../../revm/crates/revm", features = ["with-serde"]}
+bytes = { version = "1", features = ["serde"] }
+sha3 = "0.10.5"

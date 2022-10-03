@@ -1,61 +1,54 @@
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    iter::Peekable,
-};
+use std::collections::{hash_map::Entry, HashMap};
 
 use primitive_types::{H160, H256, U256};
+use revm::AccountInfo as Account;
 
 type Address = H160;
 
-// #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct Account {
-    /// Account nonce.
-    pub nonce: u64,
-    /// Account balance.
-    pub balance: u128,
-    /// Storage
-    pub storage_root: H256,
-    /// Account code.
-    pub code_hash: H256,
-}
-
 #[derive(Clone)]
 pub struct ModifiedAccount {
-    original: Account,
+    original: Option<Account>,
     modified: Account,
 }
 
 #[derive(Clone)]
 pub enum StateAccess {
-    Read(Box<Account>),
+    Read(Option<Box<Account>>),
     ReadThenWrite(Box<ModifiedAccount>),
     Write(Box<Account>),
 }
 
 impl StateAccess {
-    pub fn merge(self, other: Self) -> Self {
-        match (self, other) {
+    pub fn merge(self, rhs: Self) -> Self {
+        match (self, rhs) {
             (StateAccess::Read(l), StateAccess::Read(r)) => {
-                assert_eq!(*l, *r);
+                assert_eq!(l, r);
                 StateAccess::Read(l)
             }
             (StateAccess::Read(l), StateAccess::ReadThenWrite(r)) => {
-                assert_eq!(*l, r.original);
+                match l {
+                    Some(acct) => {
+                        assert_eq!(&*acct, r.original.as_ref().expect("Must contain an entry"))
+                    }
+                    None => assert!(r.original.is_none()),
+                }
                 StateAccess::ReadThenWrite(r)
             }
             (StateAccess::Read(l), StateAccess::Write(r)) => {
                 StateAccess::ReadThenWrite(Box::new(ModifiedAccount {
-                    original: *l,
+                    original: match l {
+                        Some(acct) => Some(*acct),
+                        None => None,
+                    },
                     modified: *r,
                 }))
             }
             (StateAccess::ReadThenWrite(l), StateAccess::Read(r)) => {
-                assert_eq!(l.modified, *r);
+                assert_eq!(l.modified, *r.expect("Must contain an entry"));
                 StateAccess::ReadThenWrite(l)
             }
             (StateAccess::ReadThenWrite(mut l), StateAccess::ReadThenWrite(r)) => {
-                assert_eq!(l.modified, r.original);
+                assert_eq!(l.modified, r.original.expect("Must contain an entry"));
                 l.modified = r.modified;
                 StateAccess::ReadThenWrite(l)
             }
@@ -64,11 +57,11 @@ impl StateAccess {
                 StateAccess::ReadThenWrite(l)
             }
             (StateAccess::Write(l), StateAccess::Read(r)) => {
-                assert_eq!(*l, *r);
+                assert_eq!(*l, *r.expect("Must contain an entry"));
                 StateAccess::Write(l)
             }
             (StateAccess::Write(l), StateAccess::ReadThenWrite(r)) => {
-                assert_eq!(*l, r.original);
+                assert_eq!(*l, r.original.expect("Must contain an entry"));
                 StateAccess::Write(Box::new(r.modified))
             }
             (StateAccess::Write(_), StateAccess::Write(r)) => StateAccess::Write(r),
@@ -76,72 +69,10 @@ impl StateAccess {
     }
 }
 
+#[derive(Default)]
 pub struct LeafStateLog {
     pub accounts: HashMap<Address, StateAccess>,
     pub state: HashMap<(Address, U256), U256>,
-}
-
-pub enum EitherOrBoth<T, U> {
-    Both(T, U),
-    Left(T),
-    Right(U),
-}
-
-pub struct UnequalZipper<T, U>
-where
-    T: Iterator,
-    U: Iterator,
-{
-    l: T,
-    r: U,
-}
-pub trait ZipHelper {
-    fn zip_all<O: IntoIterator<IntoIter = U>, T: Iterator, U: Iterator>(
-        self,
-        other: O,
-    ) -> UnequalZipper<T, U>
-    where
-        Self: IntoIterator<IntoIter = T> + Sized,
-    {
-        UnequalZipper {
-            l: self.into_iter(),
-            r: other.into_iter(),
-        }
-    }
-}
-
-// Take two size hints in the format (lower_bound, Option<upper_bound>) and construct a size hint for the longer of the two.
-// Per the size_hint documentation, returns `None` for the upper bound if either constituent returns an upper bound of `None`.
-fn size_hint_max(l: (usize, Option<usize>), r: (usize, Option<usize>)) -> (usize, Option<usize>) {
-    let lower_bound = std::cmp::max(l.0, r.0);
-    let upper_bound = match (l.1, r.1) {
-        (Some(left_upper), Some(right_upper)) => Some(std::cmp::max(left_upper, right_upper)),
-        _ => None,
-    };
-    (lower_bound, upper_bound)
-}
-
-impl<T, U, L, R> std::iter::Iterator for UnequalZipper<T, U>
-where
-    T: Iterator<Item = L>,
-    U: Iterator<Item = R>,
-{
-    type Item = EitherOrBoth<L, R>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        match (self.l.next(), self.r.next()) {
-            (None, None) => None,
-            (Some(l), None) => Some(EitherOrBoth::Left(l)),
-            (None, Some(r)) => Some(EitherOrBoth::Right(r)),
-            (Some(l), Some(r)) => Some(EitherOrBoth::Both(l, r)),
-        }
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        size_hint_max(self.l.size_hint(), self.r.size_hint())
-    }
 }
 
 pub trait MergeableLog {
@@ -151,7 +82,8 @@ pub trait MergeableLog {
 }
 
 pub trait OrderedReadLog: MergeableLog {
-    fn add_read(&mut self, addr: &Address, value: Account);
+    fn new() -> Self;
+    fn add_read(&mut self, addr: &Address, value: &Option<Account>);
 }
 
 pub trait OrderedRwLog: OrderedReadLog {
@@ -238,25 +170,35 @@ impl MergeableLog for Vec<(Address, StateAccess)> {
 }
 
 impl OrderedReadLog for LeafStateLog {
-    fn add_read(&mut self, addr: &Address, value: Account) {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn add_read(&mut self, addr: &Address, value: &Option<Account>) {
         match self.accounts.entry(*addr) {
             Entry::Occupied(existing) => {
                 match existing.get() {
                     // If we've already read this slot, ensure that the two reads match, then discard one.
-                    StateAccess::Read(r) => {
-                        assert_eq!(**r, value)
-                    }
+                    StateAccess::Read(r) => match r {
+                        Some(acct) => {
+                            assert_eq!(&**acct, value.as_ref().expect("Must contain a value"))
+                        }
+                        None => assert!(value.is_none()),
+                    },
                     // If this slot has already been written, ensure that the value we just read is the one previously written
                     StateAccess::ReadThenWrite(m) => {
-                        assert_eq!(m.modified, value)
+                        assert_eq!(&m.modified, value.as_ref().expect("Must contain a value"))
                     }
                     StateAccess::Write(w) => {
-                        assert_eq!(**w, value)
+                        assert_eq!(&**w, value.as_ref().expect("Must contain a value"))
                     }
                 };
             }
             Entry::Vacant(v) => {
-                v.insert_entry(StateAccess::Read(Box::new(value)));
+                match value {
+                    Some(acct) => v.insert_entry(StateAccess::Read(Some(Box::new(acct.clone())))),
+                    None => v.insert_entry(StateAccess::Read(None)),
+                };
             }
         }
     }
@@ -271,7 +213,7 @@ impl OrderedRwLog for LeafStateLog {
                     // If we've already read this slot, turn into into a readThenWrite entry
                     StateAccess::Read(r) => {
                         *entry_value = StateAccess::ReadThenWrite(Box::new(ModifiedAccount {
-                            original: *r.clone(),
+                            original: r.clone().map(|x| *x),
                             modified: value,
                         }));
                     }
@@ -287,73 +229,6 @@ impl OrderedRwLog for LeafStateLog {
             Entry::Vacant(v) => {
                 v.insert_entry(StateAccess::Write(Box::new(value)));
             }
-        }
-    }
-}
-
-pub struct Merger<T, U, X>
-where
-    T: Iterator<Item = X>,
-    U: Iterator<Item = X>,
-{
-    l: Peekable<T>,
-    r: Peekable<U>,
-}
-
-// pub trait MergeIter {
-//     fn merge<
-//         Rhs: IntoIterator<IntoIter = R>,
-//         L: Iterator<Item = X>,
-//         R: Iterator<Item = X>,
-//         X: PartialOrd,
-//     >(
-//         self,
-//         rhs: Rhs,
-//     ) -> Merger<L, R, X>
-//     where
-//         Self: IntoIterator<IntoIter = L> + Sized,
-//     {
-//         Merger {
-//             l: self.into_iter().peekable(),
-//             r: rhs.into_iter().peekable(),
-//         }
-//     }
-// }
-
-pub trait MergeIter<Rhs, L, R, X>
-where
-    Self: IntoIterator<IntoIter = L> + Sized,
-    Rhs: IntoIterator<IntoIter = R>,
-    L: Iterator<Item = X>,
-    R: Iterator<Item = X>,
-    X: PartialOrd,
-{
-    fn merge(self, rhs: Rhs) -> Merger<L, R, X> {
-        Merger {
-            l: self.into_iter().peekable(),
-            r: rhs.into_iter().peekable(),
-        }
-    }
-}
-
-impl<Lhs, Rhs, L, R, X> MergeIter<Rhs, L, R, X> for Lhs
-where
-    Lhs: IntoIterator<IntoIter = L>,
-    Rhs: IntoIterator<IntoIter = R>,
-    L: Iterator<Item = X>,
-    R: Iterator<Item = X>,
-    X: PartialOrd,
-{
-}
-
-impl<L: Iterator<Item = X>, R: Iterator<Item = X>, X: PartialOrd> Iterator for Merger<L, R, X> {
-    type Item = X;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.r.peek() > self.l.peek() {
-            self.r.next()
-        } else {
-            self.l.next()
         }
     }
 }

@@ -1,7 +1,11 @@
 #![feature(entry_insert)]
 use risc0_zkvm::host::Receipt;
 
+pub mod db;
+pub mod tx;
 pub mod verifiable_state;
+use serde::{Deserialize, Serialize};
+use verifiable_state::{OrderedReadLog, OrderedRwLog};
 
 pub enum Job {
     Todo,
@@ -14,7 +18,11 @@ pub enum BundlePrevalidationError {
 }
 
 pub enum DeserializationError {}
-pub enum SignatureValidationError {}
+
+#[derive(Serialize, Deserialize)]
+pub enum SignatureValidationError {
+    Any,
+}
 
 type MethodId = &'static [u8];
 
@@ -24,9 +32,6 @@ pub enum ComputationTree {
 }
 
 pub struct Bundle;
-
-pub trait OrderedReadLog {}
-pub trait OrderedRwLog: OrderedReadLog {}
 
 pub trait SequencerState {
     /// An address in the underlying DA layer
@@ -59,7 +64,7 @@ pub trait Ari {
     ) -> Result<&[u8], BundlePrevalidationError>;
 
     /// Deserializes the raw bundle into a list of transactions
-    fn deserialize_bundle<L: OrderedRwLog>(
+    fn deserialize_bundle<L: OrderedReadLog>(
         sequencer: Self::Address,
         bytes: &[u8],
         rw_log: L,
@@ -79,8 +84,7 @@ pub trait Ari {
     /// Executes a transaction and adds its state into the RW Log
     fn execute_transaction<L: OrderedRwLog>(
         tx: Self::Transaction,
-        rw_log: L,
-    ) -> Result<(), SignatureValidationError>;
+    ) -> Result<L, SignatureValidationError>;
 
     /// Verifies execution of a transaction and merges its state into the RW Log
     fn verify_transaction<L: OrderedRwLog>(
