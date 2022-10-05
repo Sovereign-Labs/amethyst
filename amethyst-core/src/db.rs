@@ -1,13 +1,20 @@
 use bytes::Bytes;
-use primitive_types::H256;
+use primitive_types::{H256, U256};
 use revm::{db::Database, AccountInfo};
 use risc0_zkvm_guest::env;
 use sha3::{Digest, Keccak256};
 
-use crate::verifiable_state::{LeafStateLog, OrderedReadLog};
+use crate::verifiable_state::{
+    EvmStateEntry, EvmStateLog, EvmStorageAddress, OrderedReadLog, OrderedRwLog,
+};
 
-pub struct HostDB {
-    log: LeafStateLog,
+pub struct HostDB<'a, L: OrderedRwLog<State = EvmStateEntry>> {
+    log: &'a mut L,
+}
+impl<'a, L: OrderedRwLog<State = EvmStateEntry>> HostDB<'a, L> {
+    pub fn from_log(log: &'a mut L) -> Self {
+        Self { log }
+    }
 }
 
 // TODO: swap for optimized implementation
@@ -15,9 +22,11 @@ fn keccak256(bytes: &[u8]) -> H256 {
     H256::from_slice(Keccak256::digest(&bytes).as_slice())
 }
 
-pub struct HostDBError;
+pub enum HostDBError {
+    InvalidBlockHashRequest,
+}
 
-impl Database for HostDB {
+impl<'a, L: OrderedRwLog<State = EvmStateEntry>> Database for HostDB<'a, L> {
     type Error = HostDBError;
 
     fn basic(
@@ -25,7 +34,8 @@ impl Database for HostDB {
         address: primitive_types::H160,
     ) -> Result<Option<AccountInfo>, Self::Error> {
         let acct: Option<AccountInfo> = env::read();
-        self.log.add_read(&address, &acct);
+        self.log
+            .add_read(&EvmStateEntry::Accounts(address, acct.clone()));
         Ok(acct)
     }
 
@@ -47,13 +57,21 @@ impl Database for HostDB {
         address: primitive_types::H160,
         index: primitive_types::U256,
     ) -> Result<primitive_types::U256, Self::Error> {
-        todo!()
+        let val: Option<U256> = env::read();
+        self.log.add_read(&EvmStateEntry::Storage(
+            EvmStorageAddress(address, index),
+            val,
+        ));
+        Ok(val.unwrap_or_default())
     }
 
     fn block_hash(
         &mut self,
         number: primitive_types::U256,
     ) -> Result<primitive_types::H256, Self::Error> {
-        todo!()
+        let val: Option<H256> = env::read();
+        self.log
+            .add_read(&EvmStateEntry::Blockhash(number.as_u64(), val));
+        val.ok_or(HostDBError::InvalidBlockHashRequest)
     }
 }

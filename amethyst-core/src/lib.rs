@@ -52,6 +52,7 @@ pub trait Ari {
     type Transaction;
     type Address;
     type StateCommitment;
+    type StateEntry;
 
     // TODO: the interface of this method will change
     fn next_bundle<'a, I: Iterator<Item = (Self::Address, &'a [u8])>>(bytes: &'a [u8]) -> I;
@@ -64,35 +65,41 @@ pub trait Ari {
     ) -> Result<&[u8], BundlePrevalidationError>;
 
     /// Deserializes the raw bundle into a list of transactions
-    fn deserialize_bundle<L: OrderedReadLog>(
+    fn deserialize_bundle<L: OrderedReadLog<State = Self::StateEntry>>(
         sequencer: Self::Address,
         bytes: &[u8],
         rw_log: L,
     ) -> Result<Bundle, DeserializationError>;
 
-    fn filter_transactions<L: OrderedRwLog, I: Iterator<Item = Self::Transaction>>(
+    fn filter_transactions<
+        L: OrderedRwLog<State = Self::StateEntry>,
+        I: Iterator<Item = Self::Transaction>,
+    >(
         bundle: Bundle,
         rw_log: L,
     ) -> I;
 
     /// Applies all transactions, updating the state (including the sequencer balance) as necessary via the RwLog
-    fn apply_transactions<L: OrderedRwLog, I: Iterator<Item = Self::Transaction>>(
+    fn apply_transactions<
+        L: OrderedRwLog<State = Self::StateEntry>,
+        I: Iterator<Item = Self::Transaction>,
+    >(
         bundle: I,
         rw_log: L,
     ) -> Result<(), SignatureValidationError>;
 
     /// Executes a transaction and adds its state into the RW Log
-    fn execute_transaction<L: OrderedRwLog>(
+    fn execute_transaction<L: OrderedRwLog<State = Self::StateEntry>>(
         tx: Self::Transaction,
     ) -> Result<L, SignatureValidationError>;
 
     /// Verifies execution of a transaction and merges its state into the RW Log
-    fn verify_transaction<L: OrderedRwLog>(
+    fn verify_transaction<L: OrderedRwLog<State = Self::StateEntry>>(
         tx: Self::Transaction,
         rw_log: L,
     ) -> Result<(), SignatureValidationError>;
 
-    fn apply_rw_log<L: OrderedRwLog>(
+    fn apply_rw_log<L: OrderedRwLog<State = Self::StateEntry>>(
         prev_state_commit: Self::StateCommitment,
         rw_log: L,
     ) -> Self::StateCommitment;

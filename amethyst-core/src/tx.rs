@@ -2,7 +2,8 @@ use primitive_types::{H160, H256, U256};
 use risc0_zkvm_guest::env;
 
 use crate::{
-    verifiable_state::{OrderedReadLog, OrderedRwLog},
+    db::HostDB,
+    verifiable_state::{EvmStateEntry, EvmStateLog, OrderedReadLog, OrderedRwLog},
     Ari, SignatureValidationError,
 };
 
@@ -64,6 +65,7 @@ impl Ari for EvmRollup {
     type Address = H160;
     type StateCommitment = H256;
     type Transaction = EvmTransaction;
+    type StateEntry = EvmStateEntry;
 
     fn next_bundle<'a, I: Iterator<Item = (Self::Address, &'a [u8])>>(bytes: &'a [u8]) -> I {
         todo!()
@@ -92,7 +94,7 @@ impl Ari for EvmRollup {
         todo!()
     }
 
-    fn execute_transaction<L: OrderedRwLog>(
+    fn execute_transaction<L: OrderedRwLog<State = EvmStateEntry>>(
         tx: Self::Transaction,
     ) -> Result<L, SignatureValidationError> {
         let sender: Result<H160, SignatureValidationError> = env::read();
@@ -104,11 +106,11 @@ impl Ari for EvmRollup {
         assert_eq!(sender, tx.sender);
 
         // TODO: get size hints from the prover
-        // let rw_log = L::new();
-        // let evm = revm::new();
-        todo!();
+        let mut rw_log = L::default();
+        let db = HostDB::from_log(&mut rw_log);
+        let evm = revm::new::<HostDB<L>>();
 
-        // Ok(rw_log)
+        Ok(rw_log)
     }
 
     fn apply_transactions<L: OrderedRwLog, I: Iterator<Item = Self::Transaction>>(

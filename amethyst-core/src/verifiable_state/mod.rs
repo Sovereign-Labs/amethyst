@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
 };
 
-use primitive_types::{H160, U256};
+use primitive_types::{H160, H256, U256};
 use revm::AccountInfo;
 type EvmAddress = H160;
 
@@ -20,6 +20,7 @@ pub use evm::*;
 pub enum EvmStateEntry {
     Accounts(EvmAddress, Option<AccountInfo>),
     Storage(EvmStorageAddress, Option<U256>),
+    Blockhash(u64, Option<H256>),
 }
 
 pub trait MergeableLog {
@@ -28,9 +29,8 @@ pub trait MergeableLog {
     fn merge(self, rhs: Self) -> Self::Into;
 }
 
-pub trait OrderedReadLog: MergeableLog {
+pub trait OrderedReadLog: MergeableLog + Default {
     type State;
-    fn new() -> Self;
     fn add_read(&mut self, item: &Self::State);
 }
 

@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
 };
 
-use primitive_types::U256;
+use primitive_types::{H256, U256};
 use revm::AccountInfo;
 
 use super::{
@@ -14,15 +14,17 @@ use super::{
 pub struct EvmStateLog {
     pub accounts: HashMap<EvmAddress, Access<AccountInfo>>,
     pub state: HashMap<EvmStorageAddress, Access<U256>>,
+    pub blockhashes: HashMap<u64, Option<H256>>,
 }
 
 #[derive(Hash, PartialEq, Eq, Debug, Clone)]
-pub struct EvmStorageAddress(EvmAddress, U256);
+pub struct EvmStorageAddress(pub EvmAddress, pub U256);
 
 impl MergeableLog for EvmStateLog {
     type Into = Vec<(EvmAddress, Access<AccountInfo>)>;
     /// Merges the read and write logs of two separate proofs to create a master log with the minimal amount of information
     /// necessary to verify both proofs against the old state commitment and compute the new one.
+    /// FIXME: Only merges account read/writes
     fn merge(mut self, rhs: Self) -> Self::Into {
         let mut output = Vec::with_capacity(rhs.accounts.len() + self.accounts.len());
         for (addr, right) in rhs.accounts.into_iter() {
@@ -161,14 +163,19 @@ where
 
 impl OrderedReadLog for EvmStateLog {
     type State = EvmStateEntry;
-    fn new() -> Self {
-        Self::default()
-    }
 
     fn add_read(&mut self, item: &Self::State) {
         match item {
             EvmStateEntry::Accounts(k, v) => do_add_read(&mut self.accounts, *k, v),
             EvmStateEntry::Storage(k, v) => do_add_read(&mut self.state, k.clone(), v),
+            EvmStateEntry::Blockhash(blocknumber, hash) => {
+                match self.blockhashes.entry(*blocknumber) {
+                    Entry::Occupied(e) => assert_eq!(hash, e.get()),
+                    Entry::Vacant(vacancy) => {
+                        vacancy.insert(*hash);
+                    }
+                }
+            }
         };
     }
 }
@@ -181,6 +188,7 @@ impl OrderedRwLog for EvmStateLog {
                 assert!(v.is_some(), "Storage slots cannot be deleted!");
                 do_add_write(&mut self.state, k, v)
             }
+            EvmStateEntry::Blockhash(_, _) => unreachable!("block hash cannot be modified"),
         };
     }
 }

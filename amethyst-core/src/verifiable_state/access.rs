@@ -6,6 +6,13 @@ pub struct Modified<T> {
 }
 
 #[derive(Clone)]
+/// `Access` represents a sequence of events on a particular value.
+/// For example, a transaction might read a value, then take some action which causes it to be updated
+/// The rules for defining causality are as follows:
+/// 1. If a read is preceded by another read, check that the two reads match and discard one.
+/// 2. If a read is preceded by a write, check that the value read matches the value written. Discard the read.
+/// 3. Otherwise, retain the read.
+/// 4. A write is retained unless it is followed by another write.
 pub enum Access<T> {
     // In the EVM, empty accounts are not represented in the MPT
     // """ The final state, σ, is reached after deleting all accounts
@@ -27,12 +34,6 @@ where
             }
             (Access::Read(l), Access::ReadThenWrite(r)) => {
                 assert_eq!(l, r.original);
-                // match l {
-                //     Some(acct) => {
-                //         assert_eq!(acct, r.original.expect("Must contain an entry"))
-                //     }
-                //     None => assert!(r.original.is_none()),
-                // }
                 Access::ReadThenWrite(r)
             }
             (Access::Read(l), Access::Write(r)) => Access::ReadThenWrite(Modified {
