@@ -13,3 +13,4 @@ serde = "1"
 revm = { path = "../../revm/crates/revm", features = ["with-serde"]}
 bytes = { version = "1", features = ["serde"] }
 sha3 = "0.10.5"
+hashbrown = "0.12.3"

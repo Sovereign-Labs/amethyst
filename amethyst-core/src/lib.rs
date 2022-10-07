@@ -1,8 +1,10 @@
 #![feature(entry_insert)]
 use risc0_zkvm::host::Receipt;
 
+pub mod ari;
 pub mod db;
 pub mod tx;
+pub mod tx_trie;
 pub mod verifiable_state;
 use serde::{Deserialize, Serialize};
 use verifiable_state::{OrderedReadLog, OrderedRwLog};
@@ -53,6 +55,7 @@ pub trait Ari {
     type Address;
     type StateCommitment;
     type StateEntry;
+    type Environment;
 
     // TODO: the interface of this method will change
     fn next_bundle<'a, I: Iterator<Item = (Self::Address, &'a [u8])>>(bytes: &'a [u8]) -> I;

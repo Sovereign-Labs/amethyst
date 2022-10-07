@@ -5,100 +5,107 @@ use std::{
 
 use primitive_types::{H256, U256};
 use revm::AccountInfo;
+use serde::{Deserialize, Serialize};
 
 use super::{
     Access, EvmAddress, EvmStateEntry, MergeableLog, Modified, OrderedReadLog, OrderedRwLog,
 };
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct EvmStateLog {
     pub accounts: HashMap<EvmAddress, Access<AccountInfo>>,
     pub state: HashMap<EvmStorageAddress, Access<U256>>,
     pub blockhashes: HashMap<u64, Option<H256>>,
 }
 
-#[derive(Hash, PartialEq, Eq, Debug, Clone)]
+#[derive(Hash, PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct EvmStorageAddress(pub EvmAddress, pub U256);
 
 impl MergeableLog for EvmStateLog {
-    type Into = Vec<(EvmAddress, Access<AccountInfo>)>;
-    /// Merges the read and write logs of two separate proofs to create a master log with the minimal amount of information
-    /// necessary to verify both proofs against the old state commitment and compute the new one.
-    /// FIXME: Only merges account read/writes
-    fn merge(mut self, rhs: Self) -> Self::Into {
-        let mut output = Vec::with_capacity(rhs.accounts.len() + self.accounts.len());
-        for (addr, right) in rhs.accounts.into_iter() {
-            let combined_entry = if let Some(left) = self.accounts.remove(&addr) {
-                left.merge(right)
-            } else {
-                right
-            };
-
-            output.push((addr, combined_entry))
-        }
-        for item in self.accounts.into_iter() {
-            output.push(item)
-        }
-        // TODO: improve efficiency from N log(N) to O(N) with hints from the host.
-        output.sort_by(|(left_addr, _), (right_addr, _)| left_addr.cmp(right_addr));
-        output
-    }
-}
-
-impl MergeableLog for Vec<(EvmAddress, Access<AccountInfo>)> {
     type Into = Self;
-    fn merge(self, rhs: Self) -> Self::Into {
-        let mut output = Vec::with_capacity(self.len() + rhs.len());
-        let mut rhs = rhs.into_iter();
-        let mut lhs = self.into_iter();
 
-        let mut left = lhs.next();
-        let mut right = rhs.next();
-        loop {
-            match (left, right) {
-                // If both iterators are exhausted, we've processed every element. Return the output
-                (None, None) => return output,
-                // If one iterator is exhausted, we don't need to do any more work. Just put any remaining items
-                // from the other iterator into the output and return
-                (None, Some(r)) => {
-                    output.push(r);
-                    output.extend(rhs);
-                    return output;
-                }
-                (Some(l), None) => {
-                    output.push(l);
-                    output.extend(lhs);
-                    return output;
-                }
-                // If both iterators are still populated, compare the first item from each.
-                (Some(l), Some(r)) => match l.0.cmp(&r.0) {
-                    // If they don't match, advance the iterator that's behind.
-                    // Since the two locations are different, we don't need to do any merging.
-                    // Simply pop the lower item and throw it into the output array
-                    std::cmp::Ordering::Less => {
-                        output.push(l);
-                        left = lhs.next();
-                        right = Some(r);
-                    }
-                    // If the two storage locations *do* match, then we need to merge the accesses.
-                    // Do that, then advance both iterators.
-                    std::cmp::Ordering::Equal => {
-                        output.push((l.0, l.1.merge(r.1)));
-                        left = lhs.next();
-                        right = rhs.next();
-                    }
-                    // If the right-hand iterator is behind, advance it using the mirror of the logic
-                    // above
-                    std::cmp::Ordering::Greater => {
-                        output.push(r);
-                        left = Some(l);
-                        right = rhs.next();
-                    }
-                },
-            }
-        }
+    fn merge(self, rhs: Self) -> Self::Into {
+        todo!()
     }
+
+    // type Into = Vec<(EvmAddress, Access<AccountInfo>)>;
+    // /// Merges the read and write logs of two separate proofs to create a master log with the minimal amount of information
+    // /// necessary to verify both proofs against the old state commitment and compute the new one.
+    // /// FIXME: Only merges account read/writes
+    // fn merge(mut self, rhs: Self) -> Self::Into {
+    //     let mut output = Vec::with_capacity(rhs.accounts.len() + self.accounts.len());
+    //     for (addr, right) in rhs.accounts.into_iter() {
+    //         let combined_entry = if let Some(left) = self.accounts.remove(&addr) {
+    //             left.merge(right)
+    //         } else {
+    //             right
+    //         };
+
+    //         output.push((addr, combined_entry))
+    //     }
+    //     for item in self.accounts.into_iter() {
+    //         output.push(item)
+    //     }
+    //     // TODO: improve efficiency from N log(N) to O(N) with hints from the host.
+    //     output.sort_by(|(left_addr, _), (right_addr, _)| left_addr.cmp(right_addr));
+    //     output
+    // }
 }
+
+// impl MergeableLog for Vec<(EvmAddress, Access<AccountInfo>)> {
+//     type Into = Self;
+//     fn merge(self, rhs: Self) -> Self::Into {
+//         let mut output = Vec::with_capacity(self.len() + rhs.len());
+//         let mut rhs = rhs.into_iter();
+//         let mut lhs = self.into_iter();
+
+//         let mut left = lhs.next();
+//         let mut right = rhs.next();
+//         loop {
+//             match (left, right) {
+//                 // If both iterators are exhausted, we've processed every element. Return the output
+//                 (None, None) => return output,
+//                 // If one iterator is exhausted, we don't need to do any more work. Just put any remaining items
+//                 // from the other iterator into the output and return
+//                 (None, Some(r)) => {
+//                     output.push(r);
+//                     output.extend(rhs);
+//                     return output;
+//                 }
+//                 (Some(l), None) => {
+//                     output.push(l);
+//                     output.extend(lhs);
+//                     return output;
+//                 }
+//                 // If both iterators are still populated, compare the first item from each.
+//                 (Some(l), Some(r)) => match l.0.cmp(&r.0) {
+//                     // If they don't match, advance the iterator that's behind.
+//                     // Since the two locations are different, we don't need to do any merging.
+//                     // Simply pop the lower item and throw it into the output array
+//                     std::cmp::Ordering::Less => {
+//                         output.push(l);
+//                         left = lhs.next();
+//                         right = Some(r);
+//                     }
+//                     // If the two storage locations *do* match, then we need to merge the accesses.
+//                     // Do that, then advance both iterators.
+//                     std::cmp::Ordering::Equal => {
+//                         output.push((l.0, l.1.merge(r.1)));
+//                         left = lhs.next();
+//                         right = rhs.next();
+//                     }
+//                     // If the right-hand iterator is behind, advance it using the mirror of the logic
+//                     // above
+//                     std::cmp::Ordering::Greater => {
+//                         output.push(r);
+//                         left = Some(l);
+//                         right = rhs.next();
+//                     }
+//                 },
+//             }
+//         }
+//     }
+// }
 
 fn do_add_read<K, V>(map: &mut HashMap<K, Access<V>>, key: K, value: &Option<V>)
 where
@@ -184,10 +191,7 @@ impl OrderedRwLog for EvmStateLog {
     fn add_write(&mut self, item: Self::State) {
         match item {
             EvmStateEntry::Accounts(k, v) => do_add_write(&mut self.accounts, k, v),
-            EvmStateEntry::Storage(k, v) => {
-                assert!(v.is_some(), "Storage slots cannot be deleted!");
-                do_add_write(&mut self.state, k, v)
-            }
+            EvmStateEntry::Storage(k, v) => do_add_write(&mut self.state, k, v),
             EvmStateEntry::Blockhash(_, _) => unreachable!("block hash cannot be modified"),
         };
     }

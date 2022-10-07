@@ -1,12 +1,13 @@
 use bytes::Bytes;
 use primitive_types::{H256, U256};
-use revm::{db::Database, AccountInfo};
+use revm::{
+    db::{Database, DatabaseCommit},
+    AccountInfo,
+};
 use risc0_zkvm_guest::env;
 use sha3::{Digest, Keccak256};
 
-use crate::verifiable_state::{
-    EvmStateEntry, EvmStateLog, EvmStorageAddress, OrderedReadLog, OrderedRwLog,
-};
+use crate::verifiable_state::{EvmStateEntry, EvmStorageAddress, OrderedRwLog};
 
 pub struct HostDB<'a, L: OrderedRwLog<State = EvmStateEntry>> {
     log: &'a mut L,
@@ -14,6 +15,33 @@ pub struct HostDB<'a, L: OrderedRwLog<State = EvmStateEntry>> {
 impl<'a, L: OrderedRwLog<State = EvmStateEntry>> HostDB<'a, L> {
     pub fn from_log(log: &'a mut L) -> Self {
         Self { log }
+    }
+}
+
+impl<'a, L: OrderedRwLog<State = EvmStateEntry>> DatabaseCommit for HostDB<'a, L> {
+    fn commit(&mut self, changes: hashbrown::HashMap<primitive_types::H160, revm::Account>) {
+        for (addr, acct) in changes.into_iter() {
+            // If the account should no longer exist, simply mark its deletion and move on
+            // FIXME: this is a bug - if an account is destroyed all of its storage needs to be cleared,
+            // which means we need to also clear the `Storage` journal.
+            if acct.is_destroyed || acct.is_empty() {
+                self.log.add_write(EvmStateEntry::Accounts(addr, None));
+                continue;
+            }
+            self.log
+                .add_write(EvmStateEntry::Accounts(addr, Some(acct.info)));
+            for (slot, value) in acct.storage {
+                let location = EvmStorageAddress(addr, slot);
+                if value.present_value().is_zero() {
+                    self.log.add_write(EvmStateEntry::Storage(location, None));
+                } else {
+                    self.log.add_write(EvmStateEntry::Storage(
+                        location,
+                        Some(value.present_value()),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -29,11 +57,22 @@ pub enum HostDBError {
 impl<'a, L: OrderedRwLog<State = EvmStateEntry>> Database for HostDB<'a, L> {
     type Error = HostDBError;
 
+    // TODO: check if the value has already been read before fetching from host
     fn basic(
         &mut self,
         address: primitive_types::H160,
     ) -> Result<Option<AccountInfo>, Self::Error> {
+        // Read the account from the host
         let acct: Option<AccountInfo> = env::read();
+
+        // Don't let the host pass in unverified bytecode. Force the EVM to fetch it
+        // explicity from code_by_hash instead.
+        if let Some(ref info) = acct {
+            assert!(
+                info.code.is_none(),
+                "Must pass code separately from account state!"
+            )
+        }
         self.log
             .add_read(&EvmStateEntry::Accounts(address, acct.clone()));
         Ok(acct)

@@ -1,11 +1,13 @@
 use core::fmt::Debug;
-#[derive(Clone)]
+
+use serde::{Deserialize, Serialize};
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Modified<T> {
     pub original: Option<Box<T>>,
     pub modified: Option<Box<T>>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 /// `Access` represents a sequence of events on a particular value.
 /// For example, a transaction might read a value, then take some action which causes it to be updated
 /// The rules for defining causality are as follows:
