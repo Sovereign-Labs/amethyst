@@ -2,36 +2,32 @@
 
 This document describes the approach to verifying and updating the "state" (accounts and storage) in Amethyst.
 
-## Overview
+## Background
 
 Ethereum stores its state in a two-tiered Merkle-Patricia Trie (MPT). The first tier consists of a mapping between `Addresses` and `Accounts`,
 while the second tier maps storage addresses to values in the context of a particular smart-contract account.
 
 Unfortunately, emulating the MPT is quite inefficient inside of a zero-knowledge computation (zkComp) because it relies on the `Keccak256`
 hash function, which makes heavy use of bitwise operations. For this reason, we want to minimize the number of MPT accesses. For additional
-efficiency, we seek to batch accesses wherever possible. This allows us to share intermediate hash computations, reducing the total
+efficiency, we seek to "batch" accesses wherever possible. This allows us to share intermediate hash computations, reducing the total
 number of operations to be performed.
 
-A first step toward accomplishing this goal, would be to use the following pattern in the zkComp:
+A simple but inefficient method of implementating state accesses, would be to use the following pattern in the zkComp:
 
 1. On first access to any state, perform a verified read (by following a Merkle path to the state root). Cache the read value.
+   - Note: Excluding `SELFDESTRUCT` operations, the first _logical_ access to any piece of state within any transaction must be a `read` operation.
+1. Storage: The gas cost of SSTORE depends on the previous value, so all `writes` are implicitly read/write pairs
+1. Accounts:
 
-- Excluding `SELFDESTRUCT` operations, the first _logical_ access to any piece of state within any transaction must be a `read` operation.
-  1. Storage: The gas cost of SSTORE depends on the previous value, so all `writes` are implicitly read/write pairs
-  1. Accounts:
-  - Contract deployments are only valid if the account in question previously had `keccak256(())` as its code hash
-  - Transfers _to_ an address increment (rather than overwriting) its balance - so the previous balance must be read before writing
-  - Transactions _from_ an address depend on both its nonce and its balance - which must be read before the transaction can be initiated.
+   - Contract deployments are only valid if the account in question previously had `keccak256(())` as its code hash
+   - Transfers _to_ an address increment (rather than overwriting) its balance - so the previous balance must be read before writing
+   - Transactions _from_ an address depend on both its nonce and its balance - which must be read before the transaction can be initiated.
 
 1. On each subsequent access, compare the `read` value to the cached value, then update the cache with the value written.
 1. At the end of the execution, verifiably write the finalized state to the MPT.
 
-However, this pattern is still not maximally efficient - it doesn't batch reads together, so many intermediate hashes will be
+However, as discussed, this pattern is far from maximally efficient. Since it doesn't batch reads together, many intermediate hashes will be
 computed multiple times.
-
-`SELFDESTRUCT` operations efficiently: the verifier would need to iterate over the
-entire storage cache and clear each relevant entry on each `SELFDESTRUCT`, which could be expensive in practice. This specification attempts
-to address these shortcomings and allow for maximally efficient state verification.
 
 ## Model
 
@@ -40,7 +36,7 @@ access to some initial state. The interface between this EVM and its environment
 
 ```typescript
 interface EVM {
-	function run_tx(..., db: ReadDb): Array<(Address, TrieChange)>;
+	function run_tx(..., db: ReadDb): Map<Address, TrieChange>;
 }
 
 // The EVM obtains state from the DB, which in turn fetches data from the host
@@ -52,8 +48,8 @@ interface ReadDb {
 	function get_block_hash(address: H160, slot: U256): U256;
 }
 
-interface WriteDb {
-	function apply_changes(Array<(Address, TrieChange)>);
+interface CommitDb: ReadDb {
+	function apply_changes(changes: Map<Address, TrieChange>);
 }
 
 // Null entries reflect "no change"
@@ -64,11 +60,24 @@ interface TrieChange {
 	nonce: U256 | null;;
 	// If the account was self-destructed, apply the storage changes
 	// onto the empty trie instead of the previous state root.
-	clear_storage: bool;
+	storage_was_cleared: bool;
 	// The storage changes must be applied to calculate the new storage_root for the account
 	storage_changes: Map<U256, U256>:
 }
 ```
+
+## Additional Constraints
+
+In Amethyst, we have groups of transactions which are all part of a single logical "bundle" posted by a single sequencer. Given the relatively
+generous per-transaction gas limits we hope to place on Amethyst, however, it may not be feasible for provers to prove entire bundles
+as one large execution. For example, an attacker may be able to craft a transaction that consumes a large proportion of the RISC machine's
+memory. To prevent this from becoming a permanent DOS vector, we either need to give the prover a mechanism for pruning caches (complex),
+or allow bundles to be broken into smaller batches which are proven separately and recursively aggregated to prove the entire block.
+
+To support the latter pattern, we want to create a data structure which supports efficient merges of state access information. For example,
+if a user updates an account balance in the first batch of transaction, and then reads and updates it again in the second batch,
+we want to be able to merge the proofs by verifying that the second read matches the first write, and then discarding both in favor of the
+first read and the last write.
 
 ## Proposed Solution
 
@@ -76,14 +85,14 @@ Rather than verifying reads and applying writes immediately, store them in a cac
 Batches can be merged together to allow efficient verification of storage access across a large number of transactions: if two batches
 touch `s` and `t` items respectively, the time to merge the batches is `s + t`.
 
-In addition to merging batches together, the cache should support running multiple transactions (seriallyO against a single underlying cache.
+In addition to merging batches together, the cache should support running multiple transactions (serially) against a single underlying cache.
 In other words, the cache must _not_ make any assumptions about the time at which changes will be applied.
 
 ### Data Structures
 
 ```typescript
 interface RWCache {
-  accounts: Map<Address, OpHistory<CachedAccountData>>;
+  accounts: Map<Address, CachedAccountData>;
   verified_code: Map<H256, Bytecode>;
   block_hashes: Map<number, H256>;
 }
@@ -95,9 +104,13 @@ interface LimitedAccount {
 }
 
 interface CachedAccountData {
-  account: LimitedAccount;
-  base_storage_root: H256;
-  storageOps: Map<U256, OpHistory<U256>>;
+  account: OpHistory<LimitedAccount>;
+  storage: OpHistory<StorageIncarnation>;
+}
+
+interface StorageIncarnation {
+  initial_root: H256;
+  ops: Map<U256, OpHistory<U256>>;
 }
 
 interface OpHistory<T> {
@@ -115,22 +128,26 @@ otherwise `first_read_value`.
 ### Get Account
 
 - When `get_account` is called, check `RWCache.accounts[Address]`.
-  - If an entry is found, return the account information from _latest_ cached value.
-  - If there is no cached value, obtain the value of the `LimitedAccount` non-deterministically. Create a new `CachedAccountData`
-    with an empty set of `storageOps` and copy the `LimitedAccount` information there. Create a new `OpHistory` with
-    the `CachedAccountData` as its `first_read_value` and no `last_written_value` and store it in the cache. Return the `LimitedAccount`
+  - If an entry is found, return the account information from the _latest_ cached account value.
+  - If there is no cached value, obtain the value of the account - including its storage root - non-deterministically. Create a new
+    `CachedAccountData` and set the `first_read_value` of the `account`. Initialize the `first_read_value` of the `storage` with the appropriate storage root and an empty set of ops. Store the new `CachedAccountData` in the cache, and return the `LimitedAccount`.
+    - Note: the `storage_root` to be specified when an account is first read should be either the root as it existed at the start of the bundle unless the account was self-destructed. In that case, it should be the empty root.
 
 ### Get Storage
 
 - When `get_storage` is called, check `RWCache.accounts[Address]`.
-  - If an entry is found, check for the slot number in the _latest_ `storageOps` list.
+  - If an entry is found, check for the slot number in the _latest_ storage incarnation.
     - If the storage slot is in cache, return the _latest_ cached value
-  - Otherwise, obtain the value of the storage slot non-deterministically, create. Create a new `OpHistory` with that value as
-    its`first_read_value` and no `last_written_value`.
-  - Otherwise, obtain the value of the `LimitedAccount` non-deterministically. Create a new `CachedAccountData`
-    with an empty set of `storageOps` and copy the `LimitedAccount` information there. Create a new `OpHistory` with
-    the `CachedAccountData` as its `first_read_value` and no `last_written_value` .Read the value of the storage slot non-deterministically. Create a new `OpHistory` with that value as its`first_read_value` and no `last_written_value`, and store it
-    in the storageOps list. Place the new `CachedAccountData` in the cache, and return the value of the storage slot.
+    - Otherwise, check if this account has been re-incarnated as part of the current execution. (We can do this using the fact that a
+      StorageIncarnation is placed in the `last_written_value` slot of its `CachedAccountData.storage` if and only if it's been newly recreated). If so, return 0. In this case, it is _not_ necessary to persist the read into the incarnation's op history.
+    - If the storage has not been re-incarnated, simply read its slot non-deterministically. Create a new `OpHistory` with that value as
+      its`first_read_value` and no `last_written_value`. Return the `first_read_value`.
+      - Note that incarnations which have the empty root as their `initial_root`, are _not_ guaranteed to be truly empty! It's possible that the incarnation had its storage updated by a previous transaction in the bundle but that the root hasn't been recalculated since then.
+        Therefore, we only treat the storage slots as being verifiably empty if we're absolutely sure that the storage has been re-incarnated.
+  - If there is no cached value, obtain the value of the account - including its storage root - non-deterministically. Create a new
+    `CachedAccountData` and set the `first_read_value` of the `account`. Initialize the `first_read_value` of the `storage` with the appropriate
+    storage root. Obtain the value of the storage slot non-deterministically, and place it into the op history of the newly initialized
+    `storage`. Store the new `CachedAccountData` in the cache. Return the value of the storage slot.
 
 ### Get Code
 
@@ -151,15 +168,15 @@ can be done only once, and aggregation can perform a (much cheaper) equality che
 ### Apply Changes
 
 After a transaction is run, each `TrieChange` needs to be applied to the cache. Loop over the list of trie changes, fetching the cache
-entry for each address. If there is no cache entry, use the logic from `get_account` to populate the `LimitedAccount` information. Construct
-a new `CachedAccountData` by applying the changes from the `TrieChange` to the latest cached value.
+entry for each address. The items must all be in cache, since there are no unconditional writes to the top-level state-trie in Ethereum.
 
 - For `nonce`, `balance`, and `code_hash`, simply take the value from the `TrieChange` if it exists, otherwise use the cached value.
-- Handling `storage` is more complicated. Here we have two cases:
-  - If `clear_storage` is `false`, iterate over `TrieChange.storage_changes` and add each value into the `CachedAccountData.storageOps`
-    list as the `last_written_value`, overwriting any previous `last_written_value`. In the general case, it would be ok if there was no
-    `first_read_value` (the data structure is designed to handle this case), but the semantics of the EVM guarantee that every slot
-    is read before being written, since gas costs vary depending on the prior value.
-  - If `clear_storage` is `true`, things get a bit hairy. There are a few possible cases:
-    1. This account was modified by a previous transaction against this cache, but its storage was _not_ cleared. In this case, the account's
-       `base_storage_root` will not have changed between `first_read_value` and `last_written_value`
+- Handling `storage` is slightly more complicated. Here we have several cases:
+  1. If `storage_was_cleared` is `false`, iterate over the storage changes and insert each one into the op history of the _latest_ `storage` incarnation.
+  1. If `storage_was_cleared` is `true`, simply overwrite the `storage.last_written_value` with the empty root and insert a new `OpHistory` item for each slot written,
+     using the value written as `last_written_value` and filling in 0s for the `first_read_value`s.
+  - Correctness: It is always safe to overwrite the `last_written_value` of storage if the account has been `SELFDESTRUCT`ed in the most recent execution. This follows from
+    the fact that we _only_ ever populate the `last_written_value` after an account has been `SELFDESTRUCT`ed. So - if the `last_written_value` was populated, that would mean
+    that an account had been destroyed and recreated within the current bundle of transactions. But if the account was reincarnated in this execution, then we've already
+    validated every `read` - they were all guaranteed to be zero unless they were preceded by a write in this execution - which our cache handles by default. And we don't
+    need to persist any writes, since they'll simply be zeroed again by the more recent `SELFDESTRUCT`.
