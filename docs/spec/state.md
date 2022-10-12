@@ -5,9 +5,9 @@ This document describes the approach to verifying and updating the "state" (acco
 ## Background
 
 Ethereum stores its state in a two-tiered Merkle-Patricia Trie (MPT). The first tier consists of a mapping between `Addresses` and `Accounts`,
-while the second tier maps storage addresses to values in the context of a particular smart-contract account.
+while the second tier maps storage slot numbers to values in the context of a particular smart-contract account.
 
-Unfortunately, emulating the MPT is quite inefficient inside of a zero-knowledge computation (zkComp) because it relies on the `Keccak256`
+Unfortunately, emulating the MPT inside of a zero-knowledge computation (zkComp) is quite inefficient because it relies on the `Keccak256`
 hash function, which makes heavy use of bitwise operations. For this reason, we want to minimize the number of MPT accesses. For additional
 efficiency, we seek to "batch" accesses wherever possible. This allows us to share intermediate hash computations, reducing the total
 number of operations to be performed.
@@ -79,14 +79,22 @@ if a user updates an account balance in the first batch of transaction, and then
 we want to be able to merge the proofs by verifying that the second read matches the first write, and then discarding both in favor of the
 first read and the last write.
 
-## Proposed Solution
-
-Rather than verifying reads and applying writes immediately, store them in a cache-like data structure for later batch verification.
-Batches can be merged together to allow efficient verification of storage access across a large number of transactions: if two batches
-touch `s` and `t` items respectively, the time to merge the batches is `s + t`.
-
 In addition to merging batches together, the cache should support running multiple transactions (serially) against a single underlying cache.
-In other words, the cache must _not_ make any assumptions about the time at which changes will be applied.
+
+## Solution Overview
+
+Rather than verifying/applying reads and writes immediately, we propose store read/write values in a cache-like data structure
+for later batch verification. This structure will store the _first_ value read, and the _most-recent_ value written to each location.
+Assuming the correctness of the black-box EVM implementation, these two pieces of information are sufficient to all the verification of
+_all_ state accesses, and the construction of a (verified) post-state.
+
+Using this convention, any two caches which cover consecutive transactions can be trivially combined together. Simply iterate over the storage locations in the later cache and verify that (1) the first-read value for each location matches the last-written value from the earlier cache (if present) or the first-read location (if no writes to the slot had occurred in the earlier batch). Then, overwrite the "last-written" value
+from the earlier cache with the value from the later one. Using this technique, caches can be merged together very efficiently: if two caches
+contain `s` and `t` items respectively, the time to merge the batches is `t`. If `t` > `s`, the technique can be reversed to allow the
+merging to take place in `O(s)` time instead.
+
+To implement this solution, we simply replace the EVM's database with one which implements the aforementioned logic, fetching
+value from the (untrusted) prover when necessary.
 
 ### Data Structures
 
@@ -172,11 +180,37 @@ entry for each address. The items must all be in cache, since there are no uncon
 
 - For `nonce`, `balance`, and `code_hash`, simply take the value from the `TrieChange` if it exists, otherwise use the cached value.
 - Handling `storage` is slightly more complicated. Here we have several cases:
-  1. If `storage_was_cleared` is `false`, iterate over the storage changes and insert each one into the op history of the _latest_ `storage` incarnation.
-  1. If `storage_was_cleared` is `true`, simply overwrite the `storage.last_written_value` with the empty root and insert a new `OpHistory` item for each slot written,
-     using the value written as `last_written_value` and filling in 0s for the `first_read_value`s.
+
+  1. If `storage_was_cleared` is `false`, iterate over the storage changes and insert each one into the operation history
+     of the _latest_ `storage` incarnation.
+  1. If `storage_was_cleared` is `true`, simply overwrite the `storage.last_written_value` with the empty root and insert a new `OpHistory` item for each slot written, using the value written as `last_written_value` and filling in 0s for the `first_read_value`s.
+
   - Correctness: It is always safe to overwrite the `last_written_value` of storage if the account has been `SELFDESTRUCT`ed in the most recent execution. This follows from
     the fact that we _only_ ever populate the `last_written_value` after an account has been `SELFDESTRUCT`ed. So - if the `last_written_value` was populated, that would mean
     that an account had been destroyed and recreated within the current bundle of transactions. But if the account was reincarnated in this execution, then we've already
     validated every `read` - they were all guaranteed to be zero unless they were preceded by a write in this execution - which our cache handles by default. And we don't
     need to persist any writes, since they'll simply be zeroed again by the more recent `SELFDESTRUCT`.
+
+### Merge
+
+To merge two caches together, use the following procedure:
+terate over the `(Address, CachedAccountData)` pairs from the later of the two caches. For each item, look up the address in the _earlier_
+cache. Call the two `CachedAccountData` structs `l` and `r` (for left and right).
+
+- If `l` is null, insert `r` into the earlier cache.
+- Otherwise, we need to merge the two cache entries.
+  - To merge the `LimitedAccount` information...
+    - Verify that `l.account.latest()` === `r.account.earliest()`.
+    - If `r.account.last_written_value` is not null, set `l.account.last_written_value` = `r.account.last_written_value`.
+  - To merge the `Storage` information...
+    - Verify that `l.storage.latest().initial_root` === `r.storage.earliest().initial_root`.
+    - For each slot "`rhs`" in `r.storage.earliest().ops`, get the corresponding slot in `l.storage.latest().ops` ("`lhs`")...
+      - If `lhs` is null, set `lhs` = `rhs`. Return to the top of the loop.
+      - Otherwise...
+        - If `rhs.first_read_value` is not null, verify that `lhs.latest()` == `rhs.first_read_value`.
+        - If `rhs.last_written_value` is not null, set `lhs.last_written_value` = `rhs.last_written_value`
+    - If `r.storage.last_written_value` is not null, set `l.storage.last_written_value` = `r.storage.last_written_value`
+
+In plain English: any time you're merging two corresponding entries `left` and `right`, verify that the latest value in `left` matches the
+earliest value in `right`. If not, the prover is malicious - exit. Otherwise, recursively merge any children
+of `left` and `right`, then overwrite the `last_written_value` of `left` with the one from `right`.
