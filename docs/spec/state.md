@@ -23,7 +23,7 @@ A simple but inefficient method of implementating state accesses, would be to us
    - Transfers _to_ an address increment (rather than overwriting) its balance - so the previous balance must be read before writing
    - Transactions _from_ an address depend on both its nonce and its balance - which must be read before the transaction can be initiated.
 
-1. On each subsequent access, compare the `read` value to the cached value, then update the cache with the value written.
+1. On each subsequent read, return the cached value. Update the cache with the each value written.
 1. At the end of the execution, verifiably write the finalized state to the MPT.
 
 However, as discussed, this pattern is far from maximally efficient. Since it doesn't batch reads together, many intermediate hashes will be
@@ -36,7 +36,7 @@ access to some initial state. The interface between this EVM and its environment
 
 ```typescript
 interface EVM {
-	function run_tx(..., db: ReadDb): Map<Address, TrieChange>;
+	function run_tx(..., db: ReadDb): Map<Address, StateTrieChange>;
 }
 
 // The EVM obtains state from the DB, which in turn fetches data from the host
@@ -49,11 +49,11 @@ interface ReadDb {
 }
 
 interface CommitDb: ReadDb {
-	function apply_changes(changes: Map<Address, TrieChange>);
+	function apply_changes(changes: Map<Address, StateTrieChange>);
 }
 
 // Null entries reflect "no change"
-interface TrieChange {
+interface StateTrieChange {
 	balance: U256 | null;
 	// The code_root of the account may have changed if the account was self-destructed.
 	code_root: H256 | null;
@@ -71,25 +71,30 @@ interface TrieChange {
 In Amethyst, we have groups of transactions which are all part of a single logical "bundle" posted by a single sequencer. Given the relatively
 generous per-transaction gas limits we hope to place on Amethyst, however, it may not be feasible for provers to prove entire bundles
 as one large execution. For example, an attacker may be able to craft a transaction that consumes a large proportion of the RISC machine's
-memory. To prevent this from becoming a permanent DOS vector, we either need to give the prover a mechanism for pruning caches (complex),
+memory. To prevent this from becoming a permanent DOS vector, we either need to give the prover a mechanism for pruning memory (complex),
 or allow bundles to be broken into smaller batches which are proven separately and recursively aggregated to prove the entire block.
 
 To support the latter pattern, we want to create a data structure which supports efficient merges of state access information. For example,
-if a user updates an account balance in the first batch of transaction, and then reads and updates it again in the second batch,
+if a user updates an account balance in the first batch of transactions, and then reads and updates it again in the second batch,
 we want to be able to merge the proofs by verifying that the second read matches the first write, and then discarding both in favor of the
 first read and the last write.
 
-In addition to merging batches together, the cache should support running multiple transactions (serially) against a single underlying cache.
+In addition to merging batches together, the data structure should support running multiple transactions (serially) against a single
+underlying instance.
 
 ## Solution Overview
 
 Rather than verifying/applying reads and writes immediately, we propose store read/write values in a cache-like data structure
-for later batch verification. This structure will store the _first_ value read, and the _most-recent_ value written to each location.
+(the "tracer") for later batch verification. This structure will store the _first_ value read, and the _most-recent_ value
+written to each location.
 Assuming the correctness of the black-box EVM implementation, these two pieces of information are sufficient to all the verification of
 _all_ state accesses, and the construction of a (verified) post-state.
 
-Using this convention, any two caches which cover consecutive transactions can be trivially combined together. Simply iterate over the storage locations in the later cache and verify that (1) the first-read value for each location matches the last-written value from the earlier cache (if present) or the first-read location (if no writes to the slot had occurred in the earlier batch). Then, overwrite the "last-written" value
-from the earlier cache with the value from the later one. Using this technique, caches can be merged together very efficiently: if two caches
+Using this convention, any two tracers which cover consecutive transactions can be trivially combined together. Simply iterate over
+the storage locations in the later tracer and verify that (1) the first-read value for each location matches the last-written value
+from the earlier tracer (if present) or the first-read location (if no writes to the slot had occurred in the earlier batch). Then,
+overwrite the "last-written" value
+from the earlier tracer with the value from the later one. Using this technique, tracer can be merged together very efficiently: if two tracers
 contain `s` and `t` items respectively, the time to merge the batches is `t`. If `t` > `s`, the technique can be reversed to allow the
 merging to take place in `O(s)` time instead.
 
@@ -99,8 +104,8 @@ value from the (untrusted) prover when necessary.
 ### Data Structures
 
 ```typescript
-interface RWCache {
-  accounts: Map<Address, CachedAccountData>;
+interface RWTracer {
+  accounts: Map<Address, TracedAccountData>;
   verified_code: Map<H256, Bytecode>;
   block_hashes: Map<number, H256>;
 }
@@ -111,7 +116,7 @@ interface LimitedAccount {
   nonce: U256;
 }
 
-interface CachedAccountData {
+interface TracedAccountData {
   account: OpHistory<LimitedAccount>;
   storage: OpHistory<StorageIncarnation>;
 }
@@ -135,33 +140,33 @@ otherwise `first_read_value`.
 
 ### Get Account
 
-- When `get_account` is called, check `RWCache.accounts[Address]`.
-  - If an entry is found, return the account information from the _latest_ cached account value.
-  - If there is no cached value, obtain the value of the account - including its storage root - non-deterministically. Create a new
-    `CachedAccountData` and set the `first_read_value` of the `account`. Initialize the `first_read_value` of the `storage` with the appropriate storage root and an empty set of ops. Store the new `CachedAccountData` in the cache, and return the `LimitedAccount`.
-    - Note: the `storage_root` to be specified when an account is first read should be either the root as it existed at the start of the bundle unless the account was self-destructed. In that case, it should be the empty root.
+- When `get_account` is called, check `RWTracer.accounts[Address]`.
+  - If an entry is found, return the account information from the _latest_ operation.
+  - If there is no entry, obtain the value of the account - including its storage root - non-deterministically. Create a new
+    `TracedAccountData`. Set the `first_read_value` of the `account` with the information provided by the host. Set the `first_read_value` of the `storage` with the appropriate storage root and an empty set of ops. Store the new `TracedAccountData` in the tracer, and return the `LimitedAccount`.
+    - Note: the `storage_root` to be specified when an account is first read should be the root as it existed at the start of the bundle unless the account was self-destructed. In that case, it should be the empty root.
 
 ### Get Storage
 
-- When `get_storage` is called, check `RWCache.accounts[Address]`.
+- When `get_storage` is called, check `RWTracer.accounts[Address]`.
   - If an entry is found, check for the slot number in the _latest_ storage incarnation.
-    - If the storage slot is in cache, return the _latest_ cached value
+    - If the storage slot has already been captured in the tracer, return the _latest_ value
     - Otherwise, check if this account has been re-incarnated as part of the current execution. (We can do this using the fact that a
-      StorageIncarnation is placed in the `last_written_value` slot of its `CachedAccountData.storage` if and only if it's been newly recreated). If so, return 0. In this case, it is _not_ necessary to persist the read into the incarnation's op history.
+      StorageIncarnation is placed in the `last_written_value` varibable of its `TracedAccountData.storage` if and only if it's been newly recreated). If so, return 0. In this case, it is _not_ necessary to persist the read into the incarnation's op history.
     - If the storage has not been re-incarnated, simply read its slot non-deterministically. Create a new `OpHistory` with that value as
       its`first_read_value` and no `last_written_value`. Return the `first_read_value`.
       - Note that incarnations which have the empty root as their `initial_root`, are _not_ guaranteed to be truly empty! It's possible that the incarnation had its storage updated by a previous transaction in the bundle but that the root hasn't been recalculated since then.
         Therefore, we only treat the storage slots as being verifiably empty if we're absolutely sure that the storage has been re-incarnated.
-  - If there is no cached value, obtain the value of the account - including its storage root - non-deterministically. Create a new
-    `CachedAccountData` and set the `first_read_value` of the `account`. Initialize the `first_read_value` of the `storage` with the appropriate
+  - If there is no entry, obtain the value of the account - including its storage root - non-deterministically. Create a new
+    `TracedAccountData`. Set the `first_read_value` of the `account` with the information provided by the host. Set the `first_read_value` of the `storage` with the appropriate
     storage root. Obtain the value of the storage slot non-deterministically, and place it into the op history of the newly initialized
-    `storage`. Store the new `CachedAccountData` in the cache. Return the value of the storage slot.
+    `storage`. Store the new `TracedAccountData` in the tracer. Return the value of the storage slot.
 
 ### Get Code
 
-- When `get_code_by_hash` is called, check `RWCache.verified_code[hash]`
+- When `get_code_by_hash` is called, check `RWTracer.verified_code[hash]`
   - If an entry is found, return it.
-  - Otherwise, read the code non-deterministically. Hash it and perform `jumpdest` analysis. Store the result in cache.
+  - Otherwise, read the code non-deterministically. Hash it and perform `jumpdest` analysis. Store the result in the tracer.
 
 TODO: consider adding an `unverified_code` cache. This would allow the elimination of expensive hashing operations when the same
 code is used in multiple proofs within the same "bundle" of transactions. Since the proofs will be aggregated later, the expensive verification
@@ -169,16 +174,17 @@ can be done only once, and aggregation can perform a (much cheaper) equality che
 
 ### Get Blockhash
 
-- When `get_blockhash` is called, check `RWCache.block_hashes[number]`.
+- When `get_blockhash` is called, check `RWTracer.block_hashes[number]`.
   - If an entry is found, return it.
-  - Otherwise, read the hash non-deterministically. Store it in the cache, and return it.
+  - Otherwise, read the hash non-deterministically. Store it in the tracer, and return it.
 
 ### Apply Changes
 
-After a transaction is run, each `TrieChange` needs to be applied to the cache. Loop over the list of trie changes, fetching the cache
-entry for each address. The items must all be in cache, since there are no unconditional writes to the top-level state-trie in Ethereum.
+After a transaction is run, each `StateTrieChange` needs to be applied to the tracer. Loop over the list of trie changes, fetching the previous
+entry for each address. The items must all be present in the tracer, since there are no unconditional writes to the top-level state-trie
+in Ethereum.
 
-- For `nonce`, `balance`, and `code_hash`, simply take the value from the `TrieChange` if it exists, otherwise use the cached value.
+- For `nonce`, `balance`, and `code_hash`, simply take the value from the `StateTrieChange` if it exists, otherwise use the value from the tracer.
 - Handling `storage` is slightly more complicated. Here we have several cases:
 
   1. If `storage_was_cleared` is `false`, iterate over the storage changes and insert each one into the operation history
@@ -188,24 +194,24 @@ entry for each address. The items must all be in cache, since there are no uncon
   - Correctness: It is always safe to overwrite the `last_written_value` of storage if the account has been `SELFDESTRUCT`ed in the most recent execution. This follows from
     the fact that we _only_ ever populate the `last_written_value` after an account has been `SELFDESTRUCT`ed. So - if the `last_written_value` was populated, that would mean
     that an account had been destroyed and recreated within the current bundle of transactions. But if the account was reincarnated in this execution, then we've already
-    validated every `read` - they were all guaranteed to be zero unless they were preceded by a write in this execution - which our cache handles by default. And we don't
+    validated every `read` - they were all guaranteed to be zero unless they were preceded by a write in this execution - which our tracer handles by default. And we don't
     need to persist any writes, since they'll simply be zeroed again by the more recent `SELFDESTRUCT`.
 
 ### Merge
 
-To merge two caches together, use the following procedure:
-terate over the `(Address, CachedAccountData)` pairs from the later of the two caches. For each item, look up the address in the _earlier_
-cache. Call the two `CachedAccountData` structs `l` and `r` (for left and right).
+To merge two tracers together, use the following procedure:
+Iterate over the `(Address, TracedAccountData)` pairs from the later of the two tracers. For each item, look up the address in the _earlier_
+tracer. Call the two `TracedAccountData` structs `l` and `r` (for left and right).
 
-- If `l` is null, insert `r` into the earlier cache.
-- Otherwise, we need to merge the two cache entries.
+- If `l` is null, insert `r` into the earlier tracer.
+- Otherwise, we need to merge the two tracer entries.
   - To merge the `LimitedAccount` information...
     - Verify that `l.account.latest()` === `r.account.earliest()`.
     - If `r.account.last_written_value` is not null, set `l.account.last_written_value` = `r.account.last_written_value`.
   - To merge the `Storage` information...
     - Verify that `l.storage.latest().initial_root` === `r.storage.earliest().initial_root`.
     - For each slot "`rhs`" in `r.storage.earliest().ops`, get the corresponding slot in `l.storage.latest().ops` ("`lhs`")...
-      - If `lhs` is null, set `lhs` = `rhs`. Return to the top of the loop.
+      - If `lhs` is null, set `lhs` = `rhs`.
       - Otherwise...
         - If `rhs.first_read_value` is not null, verify that `lhs.latest()` == `rhs.first_read_value`.
         - If `rhs.last_written_value` is not null, set `lhs.last_written_value` = `rhs.last_written_value`
